@@ -1,8 +1,8 @@
 import sys
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
-from typing import Tuple
+from typing import Tuple, List, Dict, Any
 
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
@@ -14,21 +14,33 @@ from prompt_toolkit.styles import Style
 
 import database as db
 
+
 class InputMode(Enum):
     IDLE = 1
-    ADDING_PRODUCT = 2
-    ADDING_EMPTY = 3
-    ADDING_QUANTITY = 4
+    ADDING_CRATE = 2
+    ADDING_BOTTLE = 3
+    ADDING_EMPTY = 4
+    ADDING_QUANTITY = 5
+    REMOVING_ITEM = 6
 
 # --- Application State ---
-available_products_for_selection: list = [] # List of tuples (display_name, price_with_deposit) for sales
-available_empties_for_selection: list = []  # List of tuples (display_name, credit_value) for returns
-current_cart: dict = {}                     # List of dicts: {'name': str, 'price': Decimal}
+# Type hint for clarity
+CartItemDetails = Dict[str, Any] # Keys: 'quantity', 'base_price', 'deposit', 'total_price'
+ItemToAddPayload = Dict[str, Decimal] # Keys: 'base_price', 'deposit', 'total_price'
+
+available_crates_for_selection: List[Tuple[str, Decimal, Decimal, Decimal]] = [] # (display_name, base_price, deposit, total_price)
+available_bottles_for_selection: List[Tuple[str, Decimal, Decimal, Decimal]] = [] # (display_name, base_price, deposit, total_price)
+available_empties_for_selection: List[Tuple[str, Decimal]] = []  # (display_name, credit_value)
+current_cart: Dict[str, CartItemDetails] = {} # Key: unique item name, Value: CartItemDetails
 status_message: str = ""
 input_buffer: str = ""
-input_mode: InputMode = InputMode.IDLE           # 'idle', 'adding_product_id', 'adding_empty_id', 'adding_quantity'
-item_to_add: Tuple[str, dict] | None = None                    # Temp storage: {'name': str, 'price': Decimal}
-quit_confirmation_pending: bool = False     # For quit confirmation
+input_mode: InputMode = InputMode.IDLE
+# Temp storage: (unique_name, {'base_price': Decimal, 'deposit': Decimal, 'total_price': Decimal})
+item_to_add: Tuple[str, ItemToAddPayload] | None = None
+quit_confirmation_pending: bool = False
+# Helper to map displayed cart index to item name for removal
+cart_display_order: List[str] = []
+
 
 def reset_input_state():
     """Resets the multistep input process."""
@@ -36,108 +48,162 @@ def reset_input_state():
     input_buffer = ""
     input_mode = InputMode.IDLE
     item_to_add = None
-    # Don't clear status_message here, it might hold important info (like "Input cancelled")
+    # Don't clear status_message here, it might hold important info
+
+def quantize_decimal(value: Decimal) -> Decimal:
+    """Ensure consistent two-decimal place formatting."""
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 def populate_selection_lists():
-    """Builds the separate lists for products and empties."""
-    global available_products_for_selection, available_empties_for_selection
-    available_products_for_selection = []
+    """Builds the separate lists for crates, bottles, and empties."""
+    global available_crates_for_selection, available_bottles_for_selection, available_empties_for_selection
+    available_crates_for_selection = []
+    available_bottles_for_selection = []
     available_empties_for_selection = []
 
     try:
-        # Add items for sale (products)
+        # Add Crates
         for product in db.get_products():
-            # Crate Entry
-            crate_price = product["crate_price"]
-            crate_deposit = product["crate_deposit"]
+            name = product['name']
+            crate_price = quantize_decimal(product["crate_price"])
+            crate_deposit = quantize_decimal(product["crate_deposit"])
             crate_total = crate_price + crate_deposit
-            available_products_for_selection.append((f"{product['name']} Crate", crate_total))
+            available_crates_for_selection.append((f"{name} Crate", crate_price, crate_deposit, crate_total))
 
-            # Bottle Entry
-            bottle_price = product["bottle_price"]
-            bottle_deposit = product["bottle_deposit"]
+        # Add Bottles
+        for product in db.get_products():
+            name = product['name']
+            bottle_price = quantize_decimal(product["bottle_price"])
+            bottle_deposit = quantize_decimal(product["bottle_deposit"])
             bottle_total = bottle_price + bottle_deposit
-            available_products_for_selection.append((f"{product['name']} Bottle", bottle_total))
+            available_bottles_for_selection.append((f"{name} Bottle", bottle_price, bottle_deposit, bottle_total))
 
         # Add returnable empties (credit items)
         for empty in db.get_empties():
-             available_empties_for_selection.append((empty["name"], empty["deposit_value"]))
+             # Store deposit as negative for calculations, display as positive credit
+             credit_value = quantize_decimal(empty["deposit_value"])
+             available_empties_for_selection.append((empty["name"], -credit_value)) # Store as negative
 
     except KeyError as e:
-        print(f"Error populating selection lists. An Database element is missing an required entry.\n{e}")
+        print(f"Error populating selection lists. A Database element is missing a required entry: {e}", file=sys.stderr)
+        sys.exit(1)
+    except TypeError as e:
+        print(f"Error populating selection lists. Check data types in database (expecting Decimals?): {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Sort lists
-    available_products_for_selection.sort(key=lambda item: item[0])
+
+    # Sort lists alphabetically by name
+    available_crates_for_selection.sort(key=lambda item: item[0])
+    available_bottles_for_selection.sort(key=lambda item: item[0])
     available_empties_for_selection.sort(key=lambda item: item[0])
 
 
 # --- UI Content Functions ---
 
 def _generate_item_list_text(title, items, item_type_char):
-    """Helper to generate formatted text for a list of items."""
+    """Helper to generate formatted text for a list of items (crates, bottles, empties)."""
     lines = [HTML(f"<b><u><style fg='#FFD700'>{title} ({item_type_char} + #):</style></u></b>\n")]
     if not items:
         lines.append(HTML(" <style fg='#FFA07A'>No items configured.</style>\n"))
     else:
-        for i, (name, price) in enumerate(items):
-            price_str, style_tag = None, None
-            if item_type_char == 'P':
-                price_str = f"{price:.2f} EUR"
+        for i, item_data in enumerate(items):
+            name = item_data[0]
+            price_str = ""
+            style_tag = "fg='#FFFFFF'" # Default white
+
+            if item_type_char in ('A', 'B'): # Crates (A) or Bottles (B)
+                base_price, deposit, total_price = item_data[1:]
+                price_str = f"({base_price:.2f} + {deposit:.2f}) {total_price:.2f} EUR"
                 style_tag = "fg='#90EE90'" # Light green for prices
-            elif item_type_char == 'E':
-                price_str = f"{price:.2f} EUR (Credit)"
+            elif item_type_char == 'E': # Empties
+                credit_value = abs(item_data[1]) # Display positive credit
+                price_str = f"{credit_value:.2f} EUR (Credit)"
                 style_tag = "fg='#ADD8E6'" # Light blue for credit
             else:
+                # Should not happen
                 print(f"Error generating item list format text. Invalid item_type_char: {item_type_char}")
-                sys.exit(1)
+                return HTML("<style bg='red' fg='white'>Internal Error</style>")
 
-            lines.append(HTML(f" <style fg='white'>{i+1: >2}:</style> <style fg='#FFFFFF'>{name:<30}</style> <style {style_tag}>{price_str:>15}</style>\n"))
+            lines.append(HTML(f" <style fg='white'>{i+1: >2}:</style> <style fg='#FFFFFF'>{name:<30}</style> <style {style_tag}>{price_str:>30}</style>\n"))
 
     return merge_formatted_text(lines)
 
-def get_products_text():
-    """Generates FormattedText for the available products list."""
-    return _generate_item_list_text("Products for Sale", available_products_for_selection, "P")
+def get_crates_text():
+    """Generates FormattedText for the available crates list."""
+    return _generate_item_list_text("Crates for Sale", available_crates_for_selection, "A") # 'A' for Add Crate
+
+def get_bottles_text():
+    """Generates FormattedText for the available bottles list."""
+    return _generate_item_list_text("Bottles for Sale", available_bottles_for_selection, "B") # 'B' for Add Bottle
 
 def get_empties_text():
     """Generates FormattedText for the returnable empties list."""
+    # Pass negative credit value, helper handles display
     return _generate_item_list_text("Empties for Return", available_empties_for_selection, "E")
 
-
 def get_cart_text():
-    """Generates FormattedText for the shopping cart view. (Unchanged)"""
+    """Generates FormattedText for the shopping cart view."""
+    global cart_display_order # We need to update this list here
     lines = [HTML("<b><u><style fg='#FFD700'>Current Cart:</style></u></b>\n")] # Yellow title
     total = Decimal("0.00")
+    cart_display_order = [] # Reset display order
+    target_content_width = 50
 
     if not current_cart:
         lines.append(HTML(" <style fg='#D3D3D3'>Cart is empty</style>\n")) # Light gray
     else:
-        # Sort items alphabetically for consistent cart display
+        # Sort items alphabetically for consistent cart display AND indexing
         sorted_item_names = sorted(current_cart.keys())
+        cart_display_order = sorted_item_names # Store the order for removal
 
-        for name in sorted_item_names:
+        for i, name in enumerate(sorted_item_names):
             details = current_cart[name]
             quantity = details['quantity']
-            price = details['price']
-            item_total = price * quantity
-            price_str = f"{price:.2f}"
-            item_total_str = f"{item_total:.2f} EUR"
+            base_price = details['base_price']
+            deposit = details['deposit']
+            total_price_per_item = details['total_price'] # Price per single item (base+deposit) or credit
+            item_line_total = total_price_per_item * quantity
 
-            # Determine style based on price
+            # Determine style based on price (credit items have negative total_price_per_item)
             price_style = "fg='#90EE90'" # Default green for positive prices
-            if price < 0:
+            if total_price_per_item < 0:
                 price_style = "fg='#ADD8E6'" # Blue for credit items
 
-            # Line 1: Quantity and Name
-            lines.append(HTML(f" <style fg='white'>{quantity}x</style> <style fg='#FFFFFF'>{name:<30}</style>\n"))
-            # Line 2: Indented price details
-            lines.append(HTML(f"   <style fg='#A9A9A9'> (@ {price_str}) =</style> <style {price_style}>{item_total_str:>12}</style>\n")) # Dim gray label
-            lines.append(HTML("\n")) # Add a blank line between items
-            total += item_total # Add item total to grand total
+            # Line 1: Index, Quantity and Name
+            lines.append(HTML(f"<style fg='cyan'>{i+1: >2}:</style> <style fg='white'>{quantity}x</style> <style fg='#FFFFFF'>{name:<30}</style>\n"))
 
-    lines.append(HTML("<style fg='#808080'>------------------------------------</style>\n")) # Gray separator
-    lines.append(HTML(f"<b><style fg='white'>Total:</style> <style fg='#90EE90'>{total:.2f} EUR</style></b>\n")) # White label, green total
+            indent = "     "  # 5 spaces
+
+            # Calculate price_details_str
+            if total_price_per_item < 0:
+                price_details_str = f"(Credit @ {abs(total_price_per_item):.2f})"
+            else:
+                price_details_str = f"(@ {base_price:.2f} + {deposit:.2f} Pf = {total_price_per_item:.2f})"
+
+            # Format the final total string for this line
+            total_str = f"{item_line_total:.2f} EUR"
+
+            # Calculate visible lengths (approximate, ignoring HTML tags)
+            len_part1 = len(f"{indent}{price_details_str} =")
+            len_part2 = len(total_str)
+
+            padding_needed = target_content_width - len_part1 - len_part2 - 1
+            padding_spaces = " " * max(1, padding_needed)  # Ensure at least one space
+
+            # --- Construct the final HTML line ---
+            lines.append(HTML(
+                f"{indent}<style fg='#A9A9A9'>{price_details_str} =</style>"  # Part 1 styled
+                f"{padding_spaces}"  # Dynamic padding
+                f"<style {price_style}>{total_str}</style>"  # Part 2 styled
+                "\n"
+            ))
+
+            lines.append(HTML("\n")) # Add a blank line between items
+            total += item_line_total # Add item line total to grand total
+
+    lines.append(HTML("<style fg='#808080'>-----------------------------------------</style>\n")) # Gray separator
+    total_display_style = "fg='#90EE90'" if total >= 0 else "fg='#ADD8E6'"
+    lines.append(HTML(f"<b><style fg='white'>Total:</style> <style {total_display_style}>{total:.2f} EUR</style></b>\n")) # White label, green/blue total
     return merge_formatted_text(lines)
 
 
@@ -145,10 +211,10 @@ def get_status_toolbar_text():
     """Generates FormattedText for the bottom status/command bar."""
     global status_message, quit_confirmation_pending
 
-    # Base commands - Hide Finish/Cancel/Undo during multistep input? Maybe not needed.
+    # Updated commands
     commands = HTML(
         "<style bg='#2E8B57' fg='white'> " # SeaGreen background
-        "[<b>P</b>]roduct | [<b>E</b>]mpty | [<b>F</b>]inish | [<b>C</b>]ancel | [<b>U</b>]ndo | [<b>Q</b>]uit "
+        "[<b>A</b>] Crate | [<b>B</b>] Bottle | [<b>E</b>]mpty | [<b>R</b>]emove | [<b>F</b>]inish | [<b>C</b>]ancel | [<b>Q</b>]uit " 
         "</style>"
     )
 
@@ -159,29 +225,33 @@ def get_status_toolbar_text():
     if quit_confirmation_pending:
         status_content = " Cart not empty. Press Q again to confirm quit, or any other key to cancel."
         status_style = "bg='#FFA500' fg='black'" # Orange background for warning
-    elif input_mode == InputMode.ADDING_PRODUCT:
-        status_content = f" Enter Product #: {input_buffer}"
+    elif input_mode == InputMode.ADDING_CRATE:
+        status_content = f" Enter Crate #: {input_buffer}"
+    elif input_mode == InputMode.ADDING_BOTTLE:
+        status_content = f" Enter Bottle #: {input_buffer}"
     elif input_mode == InputMode.ADDING_EMPTY:
          status_content = f" Enter Empty #: {input_buffer}"
     elif input_mode == InputMode.ADDING_QUANTITY:
-        item_name = item_to_add['name'] if item_to_add else 'Item'
+        item_name = item_to_add[0] if item_to_add else 'Item'
         status_content = f" Enter Quantity for {item_name}: {input_buffer}"
+    elif input_mode == InputMode.REMOVING_ITEM:
+         status_content = f" Enter Cart Item # to Remove: {input_buffer}"
     elif status_message:
         status_content = f" {status_message}"
         if "Error" in status_message or "Invalid" in status_message or "Cannot" in status_message:
             status_style = "bg='#DC143C' fg='white'" # Crimson background for errors
     else:
-        status_content = f" Cash: {db.get_cash_on_hand():.2f} EUR" # Default status
+        # Show cash only when idle and no other message is active
+        status_content = f" Cash: {db.get_cash_on_hand():.2f} EUR"
 
-    # Clear one-time status message after displaying it? Only if not in input mode.
+    # Clear one-time status message after displaying it only if idle and not confirming quit
     if input_mode == InputMode.IDLE and not quit_confirmation_pending:
-       pass # Keep status_message until next action unless it's cleared explicitly
+        # status_message = "" # Decided against auto-clearing, let actions clear it explicitly
+        pass
 
-    status = HTML(f" <style {status_style}>{status_content:<60}</style>") # Pad for consistent width
+    status = HTML(f" <style {status_style}>{status_content:<65}</style>") # Pad for consistent width
 
-    # Combine - only show commands and status bar for now. Input buffer integrated into status.
     full_text = merge_formatted_text([commands, status])
-
     return full_text
 
 
@@ -189,16 +259,21 @@ def get_status_toolbar_text():
 kb = KeyBindings()
 
 def handle_action_interrupt():
-    """Checks if an action interrupts quit confirmation or input mode."""
+    """Checks if an action interrupts quit confirmation or input mode. Returns True if interrupted."""
     global quit_confirmation_pending, status_message
     interrupted = False
     if quit_confirmation_pending:
         quit_confirmation_pending = False
         status_message = "Quit cancelled."
         interrupted = True
+    # Check if *any* input mode is active
     if input_mode != InputMode.IDLE:
+        current_mode = input_mode # Store before reset
         reset_input_state()
-        status_message = "Input cancelled." # Overwrites quit cancelled if both true
+        # Don't overwrite "Quit cancelled." if that happened first
+        if not interrupted:
+             status_message = "Input cancelled."
+        # If we were adding quantity, item_to_add is cleared by reset, which is correct.
         interrupted = True
     return interrupted
 
@@ -219,34 +294,65 @@ def _(event):
 
     if current_cart:
         quit_confirmation_pending = True
-        status_message = "" # Clear previous status, confirmation message is handled by get_status_toolbar_text
+        status_message = "" # Clear previous status, confirmation message is handled by toolbar
     else:
         event.app.exit() # Exit directly if cart is empty
 
 
-@kb.add('p')
+@kb.add('a') # Add Crate
 def _(event):
-    """ Start adding a product. """
+    """ Start adding a crate. """
     global input_mode, status_message
-    if handle_action_interrupt(): return # Handle confirmations/cancellations
+    if handle_action_interrupt(): return
 
     if input_mode == InputMode.IDLE:
-        status_message = "" # Clear previous status
-        reset_input_state() # Clear buffer just in case
-        input_mode = InputMode.ADDING_PRODUCT # Set mode *after* reset
+        status_message = ""
+        reset_input_state()
+        input_mode = InputMode.ADDING_CRATE
+    else:
+        # This case should ideally not be reachable due to handle_action_interrupt
+        status_message = "Error: Already in input mode. Press Esc to cancel."
+
+@kb.add('b') # Add Bottle
+def _(event):
+    """ Start adding a bottle. """
+    global input_mode, status_message
+    if handle_action_interrupt(): return
+
+    if input_mode == InputMode.IDLE:
+        status_message = ""
+        reset_input_state()
+        input_mode = InputMode.ADDING_BOTTLE
     else:
         status_message = "Error: Already in input mode. Press Esc to cancel."
 
-@kb.add('e')
+@kb.add('e') # Add Empty
 def _(event):
     """ Start adding an empty/return. """
     global input_mode, status_message
-    if handle_action_interrupt(): return # Handle confirmations/cancellations
+    if handle_action_interrupt(): return
 
     if input_mode == InputMode.IDLE:
-        status_message = "" # Clear previous status
-        reset_input_state() # Clear buffer just in case
-        input_mode = InputMode.ADDING_EMPTY # Set mode *after* reset
+        status_message = ""
+        reset_input_state()
+        input_mode = InputMode.ADDING_EMPTY
+    else:
+        status_message = "Error: Already in input mode. Press Esc to cancel."
+
+@kb.add('r') # Remove Item
+def _(event):
+    """ Start removing an item from the cart. """
+    global input_mode, status_message
+    if handle_action_interrupt(): return
+
+    if not current_cart:
+        status_message = "Cart is empty. Nothing to remove."
+        return
+
+    if input_mode == InputMode.IDLE:
+        status_message = ""
+        reset_input_state()
+        input_mode = InputMode.REMOVING_ITEM
     else:
         status_message = "Error: Already in input mode. Press Esc to cancel."
 
@@ -255,47 +361,71 @@ def _(event):
 def _(event):
     """ Finish Transaction """
     global current_cart, status_message, input_buffer, quit_confirmation_pending
-    if handle_action_interrupt(): return # Handle confirmations/cancellations
+    if handle_action_interrupt(): return
 
     if not current_cart:
         status_message = "Cart is empty. Nothing to finish."
         return
 
-    total = sum(item['price'] for item in current_cart.values())
+    # Calculate total based on stored total_price per item * quantity
+    total = Decimal("0.00")
+    for item_details in current_cart.values():
+        total += item_details['total_price'] * item_details['quantity']
+    total = quantize_decimal(total)
+
     timestamp = datetime.now().isoformat()
+
+    # Prepare items for transaction log (optional: simplify structure?)
+    logged_items = {
+        name: {
+            'quantity': details['quantity'],
+            'base_price': str(details['base_price']),
+            'deposit': str(details['deposit']),
+            'total_price_per_item': str(details['total_price']),
+            'line_total': str(quantize_decimal(details['total_price'] * details['quantity']))
+        } for name, details in current_cart.items()
+    }
 
     transaction = {
         "timestamp": timestamp,
-        "total": str(total), # Convert Decimal to string
-        "items": current_cart
+        "total": str(total), # Convert Decimal to string for storage
+        "items": logged_items
     }
 
     try:
-        db.add_transaction(transaction)
-        db.update_cash_on_hand(Decimal(total))
-        cash_on_hand = db.get_cash_on_hand() # Fetch updated value
+        if not db.add_transaction(transaction):
+            raise Exception("Transaction could not be saved to database")
+        if not db.update_cash_on_hand(total): # Use the calculated Decimal total
+            raise Exception("Cash could not be updated")
+        cash_on_hand = db.get_cash_on_hand()
         status_message = f"Transaction finished. Total: {total:.2f} EUR. Cash: {cash_on_hand:.2f} EUR."
         current_cart = {}
+        cart_display_order.clear() # Clear display order as cart is empty
+        reset_input_state() # Go back to idle
     except Exception as e:
         status_message = f"Error saving transaction: {e}"
+        # Optionally reset state here too? Depends on desired error recovery.
+        # reset_input_state()
 
 
 @kb.add('c')
 def _(event):
     """ Cancel Transaction (Clear Cart) """
-    global current_cart, status_message
-    if handle_action_interrupt(): return # Handle confirmations/cancellations
+    global current_cart, status_message, cart_display_order
+    if handle_action_interrupt(): return
 
     if not current_cart:
         status_message = "Cart is already empty."
     else:
         current_cart = {}
+        cart_display_order.clear() # Clear display order
         status_message = "Transaction cancelled. Cart cleared."
+        reset_input_state() # Ensure idle state
 
 
 @kb.add('escape')
 def _(event):
-    """ Cancel current input operation """
+    """ Cancel current input operation or quit confirmation """
     global status_message
     if input_mode != InputMode.IDLE:
         reset_input_state()
@@ -303,6 +433,7 @@ def _(event):
     elif quit_confirmation_pending:
          handle_action_interrupt() # Will reset pending flag and set message
     else:
+        # Optional: Clear status if Esc is pressed when idle
         status_message = ""
 
 
@@ -310,176 +441,236 @@ def _(event):
 def _(event):
     """ Handle backspace during input """
     global input_buffer, status_message
-    # Allow backspace only when in an input mode and buffer is not empty
-    if input_mode in [InputMode.ADDING_EMPTY, InputMode.ADDING_PRODUCT, InputMode.ADDING_QUANTITY] and input_buffer:
+    if input_mode != InputMode.IDLE and input_buffer:
         input_buffer = input_buffer[:-1]
         status_message = "" # Clear any previous error message
     elif quit_confirmation_pending:
          handle_action_interrupt() # Treat as cancelling quit confirmation
-    else:
-        # Optional: Provide feedback if backspace is pressed inappropriately
-        # status_message = "Cannot Backspace."
-        pass # Ignore
+    # else: Ignore backspace if not in input mode or buffer is empty
 
 
 @kb.add('enter')
 def _(event):
-    """ Process entered number (ID or Quantity) """
-    global input_buffer, status_message, input_mode, item_to_add, current_cart
+    """ Process entered number (ID, Quantity, or Remove Index) """
+    global input_buffer, status_message, input_mode, item_to_add, current_cart, cart_display_order
 
     if quit_confirmation_pending:
-        handle_action_interrupt() # Treat Enter as cancelling quit confirmation
+        handle_action_interrupt()
         return
 
-    if input_mode == InputMode.ADDING_PRODUCT:
+    if not input_buffer and input_mode != InputMode.IDLE:
+        status_message = "Error: No number entered."
+        # Don't clear buffer here, user might want to type something
+        return
+
+    # --- Handle ID Inputs ---
+    if input_mode == InputMode.ADDING_CRATE:
         try:
-            if not input_buffer:
-                status_message = "Error: No product number entered."
-                return
             num = int(input_buffer)
-            if 1 <= num <= len(available_products_for_selection):
+            if 1 <= num <= len(available_crates_for_selection):
                 item_index = num - 1
-                name, price = available_products_for_selection[item_index]
-                item_to_add = (name, {'price': price})
+                name, base_price, deposit, total_price = available_crates_for_selection[item_index]
+                item_to_add = (name, {'base_price': base_price, 'deposit': deposit, 'total_price': total_price})
                 input_mode = InputMode.ADDING_QUANTITY
                 input_buffer = ""
-                status_message = "" # Clear previous status
+                status_message = ""
             else:
-                status_message = f"Error: Invalid product number: {num}"
-                input_buffer = "" # Clear invalid input
+                status_message = f"Error: Invalid crate number: {num}"
+                input_buffer = ""
         except ValueError:
             status_message = f"Error: Invalid input: '{input_buffer}'"
-            input_buffer = "" # Clear invalid input
+            input_buffer = ""
+
+    elif input_mode == InputMode.ADDING_BOTTLE:
+        try:
+            num = int(input_buffer)
+            if 1 <= num <= len(available_bottles_for_selection):
+                item_index = num - 1
+                name, base_price, deposit, total_price = available_bottles_for_selection[item_index]
+                item_to_add = (name, {'base_price': base_price, 'deposit': deposit, 'total_price': total_price})
+                input_mode = InputMode.ADDING_QUANTITY
+                input_buffer = ""
+                status_message = ""
+            else:
+                status_message = f"Error: Invalid bottle number: {num}"
+                input_buffer = ""
+        except ValueError:
+            status_message = f"Error: Invalid input: '{input_buffer}'"
+            input_buffer = ""
 
     elif input_mode == InputMode.ADDING_EMPTY:
         try:
-            if not input_buffer:
-                status_message = "Error: No empty number entered."
-                return
             num = int(input_buffer)
             if 1 <= num <= len(available_empties_for_selection):
                 item_index = num - 1
-                name, price = available_empties_for_selection[item_index]
-                item_to_add = (name, {'price': price})
+                name, credit_value = available_empties_for_selection[item_index] # credit_value is negative
+                # Empties have no base price/deposit, just a total credit value
+                item_to_add = (name, {'base_price': Decimal('0.00'), 'deposit': Decimal('0.00'), 'total_price': credit_value})
                 input_mode = InputMode.ADDING_QUANTITY
                 input_buffer = ""
-                status_message = "" # Clear previous status
+                status_message = ""
             else:
                 status_message = f"Error: Invalid empty number: {num}"
-                input_buffer = "" # Clear invalid input
+                input_buffer = ""
         except ValueError:
             status_message = f"Error: Invalid input: '{input_buffer}'"
-            input_buffer = "" # Clear invalid input
+            input_buffer = ""
 
+    # --- Handle Quantity Input ---
     elif input_mode == InputMode.ADDING_QUANTITY:
         try:
-            if not input_buffer:
-                 status_message = "Error: No quantity entered."
-                 return
             quantity = int(input_buffer)
             if quantity > 0:
                 if item_to_add:
-                    # check if the product already is in the cart, if yes add the quantity
-                    if item_to_add[0] in current_cart.keys():
-                        # item already exists
-                        assert current_cart[item_to_add[0]]["price"] == item_to_add[1]["price"]
-                        current_cart[item_to_add[0]]["quantity"] += item_to_add[1]["quantity"]
+                    name, details_to_add = item_to_add
+                    base_price = details_to_add['base_price']
+                    deposit = details_to_add['deposit']
+                    total_price = details_to_add['total_price']
+
+                    if name in current_cart:
+                        # Item already exists, just add quantity
+                        # Assert that prices match (sanity check)
+                        # Note: Floating point comparisons can be tricky, but Decimal should be exact here
+                        assert current_cart[name]["total_price"] == total_price, f"Price mismatch for {name}!"
+                        current_cart[name]["quantity"] += quantity
                     else:
-                        # add the new item
-                        current_cart[item_to_add[0]] = item_to_add[1] # Add copies
-                    status_message = f"Added {quantity}x {item_to_add[0]}"
+                        # Add the new item with all details
+                        current_cart[name] = {
+                            'quantity': quantity,
+                            'base_price': base_price,
+                            'deposit': deposit,
+                            'total_price': total_price
+                        }
+                    status_message = f"Added {quantity}x {name}"
                     reset_input_state() # Back to idle
                 else:
-                     status_message = "Error: No item selected to add quantity for." # Should not happen
+                     status_message = "Error: No item selected to add quantity for (Internal Error)."
                      reset_input_state()
             else:
                 status_message = "Error: Quantity must be positive."
                 input_buffer = "" # Clear invalid input
         except ValueError:
             status_message = f"Error: Invalid quantity: '{input_buffer}'"
-            input_buffer = "" # Clear invalid input
+            input_buffer = ""
+
+    # --- Handle Remove Item Input ---
+    elif input_mode == InputMode.REMOVING_ITEM:
+        try:
+            num = int(input_buffer)
+            # cart_display_order holds the names in the order they were displayed
+            if 1 <= num <= len(cart_display_order):
+                item_index_to_remove = num - 1
+                item_name_to_remove = cart_display_order[item_index_to_remove]
+
+                if item_name_to_remove in current_cart:
+                    del current_cart[item_name_to_remove]
+                    status_message = f"Removed item #{num}: {item_name_to_remove}"
+                    # cart_display_order will be rebuilt on next cart render
+                    reset_input_state() # Back to idle
+                else:
+                    # This should not happen if cart_display_order is correct
+                    status_message = f"Error: Item '{item_name_to_remove}' not found in cart (Internal Error)."
+                    reset_input_state()
+            else:
+                status_message = f"Error: Invalid cart item number: {num}"
+                input_buffer = "" # Clear invalid input
+        except ValueError:
+            status_message = f"Error: Invalid input: '{input_buffer}'"
+            input_buffer = ""
+        except IndexError:
+             status_message = f"Error: Could not find item at index {input_buffer} (Internal Error)."
+             reset_input_state()
 
     # Ignore Enter if in 'idle' mode
 
 
 @kb.add('<any>')
 def _(event):
-    """ Handle digit input during appropriate modes """
+    """ Handle digit input during appropriate modes or cancel quit confirmation """
     global input_buffer, status_message
 
     # Always handle quit confirmation cancellation first
     if quit_confirmation_pending:
-        # Any key other than 'q' cancels the confirmation
         if event.key_sequence[0].data.lower() != 'q':
              handle_action_interrupt()
-             # Maybe process the key press normally now? Depends on desired behavior.
-             # For simplicity, let's just cancel and require re-entry of the command.
+             # Don't process the key further after cancelling quit, require re-entry.
              return
 
     char = event.key_sequence[0].data
     if char.isdigit():
-        if input_mode in [InputMode.ADDING_EMPTY, InputMode.ADDING_PRODUCT, InputMode.ADDING_QUANTITY]:
+        # Allow digits only in specific input modes
+        if input_mode in [InputMode.ADDING_CRATE, InputMode.ADDING_BOTTLE, InputMode.ADDING_EMPTY, InputMode.ADDING_QUANTITY, InputMode.REMOVING_ITEM]:
             input_buffer += char
             status_message = "" # Clear previous status/error messages
-        # Ignore digits if in 'idle' mode
-    elif char.isalpha() and char.lower() not in 'pefcq':
+        # Ignore digits if in 'idle' mode or other modes
+    elif char.isalpha():
+        # Handle known command keys (handled by their specific decorators 'a', 'b', 'e', 'r', 'f', 'c', 'q')
         # Handle unknown alphabetic keys only when idle
-         if input_mode == InputMode.IDLE:
+        known_commands = 'abefcrq' # Case-insensitive check below
+        if input_mode == InputMode.IDLE and char.lower() not in known_commands:
              status_message = f"Unknown command: {char}"
-             reset_input_state() # Ensure buffer/mode are clear
-        # else: Ignore unknown alpha keys during input
+             # reset_input_state() # Should already be idle, no buffer to clear
+        # Ignore unknown alpha keys during input modes
 
 
 # --- Layout Definition ---
 style = Style.from_dict({
-    '': 'fg:white bg:',
+    # '': 'fg:white bg:#1c1c1c', # Base style - applied to root VSplit instead
     'window.border': 'fg:#888888',
     'separator': 'fg:#606060',
     # Status bar styles are handled inline via HTML
 })
 
-# Left Pane Top: Products
-products_window = Window(
-    content=FormattedTextControl(get_products_text, focusable=False),
-    style="class:window.border" # Optional border
+# Left Pane Top: Crates
+crates_window = Window(
+    content=FormattedTextControl(get_crates_text, focusable=False),
+    style="class:window.border"
+)
+
+# Left Pane Middle: Bottles
+bottles_window = Window(
+    content=FormattedTextControl(get_bottles_text, focusable=False),
+    style="class:window.border"
 )
 
 # Left Pane Bottom: Empties
 empties_window = Window(
     content=FormattedTextControl(get_empties_text, focusable=False),
-    style="class:window.border" # Optional border
+    style="class:window.border"
 )
 
 # Right Pane: Shopping Cart
 cart_window = Window(
     content=FormattedTextControl(get_cart_text, focusable=False),
-    align=WindowAlign.LEFT
+    align=WindowAlign.LEFT # Keep alignment
 )
 
 # Bottom Toolbar: Status and Commands
 status_toolbar = Window(
     height=1,
     content=FormattedTextControl(get_status_toolbar_text, focusable=False),
-    style="class:status"
+    # style="class:status" # Styling is now inline HTML
 )
 
 # Main Layout Container
 root_container = HSplit([
-    # Top part: VSplit for Left (Products/Empties) and Right (Cart)
+    # Top part: VSplit for Left (Crates/Bottles/Empties) and Right (Cart)
     VSplit([
-        # Left side: HSplit for Products and Empties
+        # Left side: HSplit for Crates, Bottles, Empties
         HSplit([
-            products_window,
+            crates_window,
+            Window(height=1, char='─', style='class:separator'), # Horizontal separator
+            bottles_window,
             Window(height=1, char='─', style='class:separator'), # Horizontal separator
             empties_window
-        ], height=None), # Let the VSplit manage height distribution
+        ], padding=0), # Let VSplit handle padding, internal elements share height
 
         # Vertical separator
         Window(width=1, char='│', style='class:separator'),
 
         # Right side: Cart
         cart_window,
-    ], padding=1, style='bg:#1c1c1c'), # Padding around the main content area
+    ], padding=1, style='bg:#1c1c1c'), # Padding around the main content area, dark background
 
     # Bottom part: Status bar
     status_toolbar,
@@ -492,22 +683,26 @@ layout = Layout(root_container)
 def main():
     global status_message
 
-    # 1. Populate the selection lists from loaded data
-    try:
-        populate_selection_lists()
-    except Exception as e:
-         print(f"Error populating item lists: {e}", file=sys.stderr)
-         sys.exit(1)
+    print("Initializing Beverage Store CLI...")
 
+    # 1. Load database and Populate the selection lists
+    try:
+        # Ensure database connection/loading happens if needed (assuming db module handles it)
+        print("Loading data...")
+        populate_selection_lists()
+        print("Data loaded.")
+    except Exception as e:
+         print(f"FATAL: Error populating item lists during startup: {e}", file=sys.stderr)
+         sys.exit(1)
 
     # 2. Initial status
     try:
         cash_on_hand = db.get_cash_on_hand()
         status_message = f"Store Ready. Cash: {cash_on_hand:.2f} EUR"
     except Exception as e:
-        print(f"Error getting initial cash on hand: {e}", file=sys.stderr)
+        # Non-fatal? Or should it exit? Let's make it fatal for consistency.
+        print(f"FATAL: Error getting initial cash on hand: {e}", file=sys.stderr)
         sys.exit(1)
-
 
     # 3. Create and Run Application
     app = Application(
@@ -515,14 +710,25 @@ def main():
         key_bindings=kb,
         full_screen=True,
         style=style,
-        mouse_support=False
+        mouse_support=False # Keep mouse disabled unless needed
     )
-    print("Starting Beverage Store CLI... (Press Q to quit)")
+    print("Starting Application... (Press Q to quit)")
     try:
         app.run()
+    except Exception as e:
+        # Catch unexpected errors during run
+        print("\n--- UNEXPECTED APPLICATION ERROR ---", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        print("------------------------------------", file=sys.stderr)
     finally:
         print("Application exited.")
 
 
 if __name__ == "__main__":
+    # Add basic check for database module existence early
+    if 'db' not in globals():
+        print("FATAL: Database module 'database.py' could not be imported.", file=sys.stderr)
+        sys.exit(1)
     main()

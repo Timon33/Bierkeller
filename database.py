@@ -196,18 +196,6 @@ def add_transaction(transaction: dict):
     db = get_database()
     if db is None: return False
     try:
-        # Ensure Decimals in items list are correctly handled (should be if coming from CLI state)
-        # Optional: Add explicit check/conversion here if unsure about item structure
-        for item in transaction["items"]:
-            for key, value in item.items():
-                if isinstance(value, (float, int)): # Convert legacy numerics if needed
-                   if key in ['unit_price', 'unit_deposit', 'total_item_price']:
-                       try:
-                           item[key] = Decimal(str(value))
-                       except InvalidOperation:
-                            print(f"Warning: Invalid numeric format in item {item.get('name')}, key {key}. Storing as 0.")
-                            item[key] = Decimal('0.00') # Fallback
-
         db.transactions.insert_one(transaction)
         return True
     except Exception as e:
