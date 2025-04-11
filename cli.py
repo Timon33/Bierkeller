@@ -240,9 +240,6 @@ def get_status_toolbar_text():
         status_content = f" {status_message}"
         if "Error" in status_message or "Invalid" in status_message or "Cannot" in status_message:
             status_style = "bg='#DC143C' fg='white'" # Crimson background for errors
-    else:
-        # Show cash only when idle and no other message is active
-        status_content = f" Cash: {db.get_cash_on_hand():.2f} EUR"
 
     # Clear one-time status message after displaying it only if idle and not confirming quit
     if input_mode == InputMode.IDLE and not quit_confirmation_pending:
@@ -397,8 +394,7 @@ def _(event):
             raise Exception("Transaction could not be saved to database")
         if not db.update_cash_on_hand(total): # Use the calculated Decimal total
             raise Exception("Cash could not be updated")
-        cash_on_hand = db.get_cash_on_hand()
-        status_message = f"Transaction finished. Total: {total:.2f} EUR. Cash: {cash_on_hand:.2f} EUR."
+        status_message = f"Transaction finished. Total: {total:.2f} EUR"
         current_cart = {}
         cart_display_order.clear() # Clear display order as cart is empty
         reset_input_state() # Go back to idle
@@ -697,8 +693,7 @@ def main():
 
     # 2. Initial status
     try:
-        cash_on_hand = db.get_cash_on_hand()
-        status_message = f"Store Ready. Cash: {cash_on_hand:.2f} EUR"
+        status_message = f"Store Ready."
     except Exception as e:
         # Non-fatal? Or should it exit? Let's make it fatal for consistency.
         print(f"FATAL: Error getting initial cash on hand: {e}", file=sys.stderr)
