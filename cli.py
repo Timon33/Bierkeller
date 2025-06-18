@@ -366,8 +366,10 @@ def _(event):
 
     # Calculate total based on stored total_price per item * quantity
     total = Decimal("0.00")
+    profit = Decimal("0.00")
     for item_details in current_cart.values():
         total += item_details['total_price'] * item_details['quantity']
+        profit += item_details.get("margin", 0) * item_details['quantity']
     total = quantize_decimal(total)
 
     timestamp = datetime.now().isoformat()
@@ -386,6 +388,7 @@ def _(event):
     transaction = {
         "timestamp": timestamp,
         "total": str(total), # Convert Decimal to string for storage
+        "profit": str(profit),
         "items": logged_items
     }
 
@@ -394,6 +397,8 @@ def _(event):
             raise Exception("Transaction could not be saved to database")
         if not db.update_cash_on_hand(total): # Use the calculated Decimal total
             raise Exception("Cash could not be updated")
+        if not db.update_profit(profit):
+            raise Exception("Profit could not be updated")
         status_message = f"Transaction finished. Total: {total:.2f} EUR"
         current_cart = {}
         cart_display_order.clear() # Clear display order as cart is empty

@@ -190,6 +190,23 @@ def update_cash_on_hand(amount_change: Decimal):
         print(f"Error updating cash: {e}")
         return False
 
+def update_profit(profit: Decimal):
+    """Updates profit by a given Decimal amount."""
+    db = get_database()
+    if db is None: return False
+    try:
+        # Ensure amount_change is Decimal
+        change = Decimal(str(profit)) # Convert just in case input wasn't Decimal
+        # Use $inc for atomic update - MongoDB handles Decimal128 correctly here with the codec
+        result = db.values.update_one(
+            {"label": "profit"},
+            {"$inc": {"value": change}}, # Use $inc with Decimal - codec handles conversion
+            upsert=True # Ensure it exists if somehow deleted
+        )
+        return result.modified_count > 0 or result.upserted_id is not None
+    except Exception as e:
+        print(f"Error updating profit: {e}")
+        return False
 
 def add_transaction(transaction: dict):
     """Adds a transaction record to the database using Decimals."""
